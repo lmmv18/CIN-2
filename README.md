@@ -98,6 +98,16 @@ Archivos generados:
 | Rearing        | 0.93      | 0.97   | 0.95 |
 | Resting        | 0.97      | 1.00   | 0.98 |
 
+## Trabajo próximo
 
+### Corrección de interferencias
+
+### Filtrado y partición de datos
+
+Se implementará  proceso de limpieza de datos y una partición de entrenamiento-validación de 75%-25%, con el objetivo de evaluar la capacidad de generalización del modelo bajo diferentes distribuciones de datos.
+
+### Evaluación de arquitecturas alternativas
+
+Además de la arquitectura LSTM actual, se estudiará el desempeño de modelos y arquitecturas basadas en mecanismos de atención para determinar la mejor estrategia de clasificación temporal.
 
 
