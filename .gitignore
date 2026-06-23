@@ -25,3 +25,19 @@ __pycache__/
 
 .DS_Store
 Thumbs.db
+
+# Modelos
+*.keras
+
+# Datasets generados
+*.npy
+
+# Resultados
+*.png
+
+# Archivos temporales
+junk/
+
+# Modelos antiguos
+X_final.npy
+y_final.npy
