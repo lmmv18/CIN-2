@@ -1,16 +1,21 @@
-## CIN-2
+# CIN-2
 
-Sistema de clasificación automática de comportamiento animal utilizando DeepLabCut y redes neuronales LSTM.
+Sistema de clasificación automática de comportamiento animal utilizando DeepLabCut y aprendizaje profundo.
 
 ## Descripción
 
-Este proyecto permite:
+Este proyecto implementa un pipeline completo para la clasificación automática de comportamiento animal a partir de videos.
 
-1. Extraer coordenadas de puntos corporales mediante DeepLabCut.
-2. Generar embeddings espaciales y temporales a partir de las trayectorias.
-3. Construir conjuntos de datos etiquetados a partir de anotaciones manuales.
-4. Entrenar una red neuronal LSTM para clasificar comportamientos.
-5. Realizar inferencia automática sobre videos nuevos.
+El sistema utiliza DeepLabCut para extraer coordenadas corporales, genera características espacio-temporales derivadas del movimiento y entrena una red neuronal LSTM para identificar diferentes comportamientos.
+
+Actualmente el pipeline permite:
+
+* Procesar videos mediante DeepLabCut.
+* Generar embeddings a partir de trayectorias corporales.
+* Construir datasets etiquetados.
+* Entrenar modelos LSTM.
+* Evaluar desempeño mediante métricas y matrices de confusión.
+* Realizar inferencia sobre nuevos videos.
 
 ## Comportamientos clasificados
 
@@ -20,26 +25,25 @@ Este proyecto permite:
 * Rearing
 * Resting
 
-## Arquitectura
+## Pipeline
 
 ```text
 Video
-  ↓
-DeepLabCut
-  ↓
-Coordenadas (CSV)
-  ↓
-Extracción de características
-  ↓
-Embeddings
-  ↓
-Dataset etiquetado
-  ↓
-LSTM
-  ↓
-Clasificación de comportamiento
+│
+├── DeepLabCut
+│
+├── Coordenadas corporales
+│
+├── Extracción de características
+│
+├── Embeddings
+│
+├── Dataset etiquetado
+│
+├── LSTM
+│
+└── Clasificación de comportamiento
 ```
-
 
 ## Requisitos
 
@@ -53,61 +57,69 @@ Instalación:
 pip install -r requirements.txt
 ```
 
-
 ## Entrenamiento
 
-Ejecutar:
+El flujo principal del proyecto se encuentra en:
 
 ```bash
-python scripts/train/pipeline_completo.py
+python scripts/behavior_pipeline.py
 ```
 
-El pipeline realiza:
+El pipeline permite:
 
-1. Análisis de videos con DeepLabCut.
-2. Generación de embeddings.
-3. Construcción del dataset.
-4. Entrenamiento de la red LSTM.
-5. Evaluación del modelo.
+1. Procesar videos mediante DeepLabCut.
+2. Generar embeddings a partir de las trayectorias corporales.
+3. Construir conjuntos de datos etiquetados.
+4. Entrenar una red neuronal LSTM.
+5. Evaluar el desempeño del modelo mediante métricas y matrices de confusión.
 
 Archivos generados:
 
-* lstm_model.keras
-* label_encoder.pkl
-* X_final.npy
-* y_final.npy
+* `lstm_model.keras`
+* `label_encoder.pkl`
+* `X_train.npy`
+* `y_train.npy`
+* `X_test.npy`
+* `y_test.npy`
 
+## Características utilizadas
 
-## Resultados obtenidos
+Los embeddings se construyen utilizando información derivada de las trayectorias corporales obtenidas con DeepLabCut:
 
-Último entrenamiento:
+* Posición relativa de puntos corporales.
+* Velocidad.
+* Aceleración.
+* Magnitud de velocidad.
+* Distancias entre puntos corporales.
 
-| Métrica  | Valor           |
-| -------- | --------------- |
-| Accuracy | 93.71%          |
-| Macro F1 | 0.93            |
-| Dataset  | 40,966 ventanas |
+## Resultados actuales
 
-### Desempeño por clase
+Los resultados reportados corresponden a una partición por video completo, evitando fuga de información entre los conjuntos de entrenamiento y prueba.
 
-| Clase          | Precision | Recall | F1   |
-| -------------- | --------- | ------ | ---- |
-| Desplazamiento | 0.78      | 0.94   | 0.85 |
-| Grooming       | 0.88      | 0.99   | 0.93 |
-| Inmovilidad    | 0.98      | 0.86   | 0.91 |
-| Rearing        | 0.93      | 0.97   | 0.95 |
-| Resting        | 0.97      | 1.00   | 0.98 |
+| Métrica                 | Valor  |
+| ----------------------- | ------ |
+| Accuracy                | 43.2 % |
+| Videos de entrenamiento | 51     |
+| Videos de prueba        | 16     |
+| Clases                  | 5      |
 
-## Trabajo próximo
+## Observaciones
 
-### Corrección de interferencias
+La mejora más reciente se obtuvo incorporando características de aceleración derivadas de las trayectorias corporales, aumentando el desempeño del modelo respecto a versiones anteriores.
 
-### Filtrado y partición de datos
+Actualmente el principal reto corresponde al desbalance de clases, especialmente en los comportamientos Grooming y Desplazamiento.
 
-Se implementará  proceso de limpieza de datos y una partición de entrenamiento-validación de 75%-25%, con el objetivo de evaluar la capacidad de generalización del modelo bajo diferentes distribuciones de datos.
+## Trabajo futuro
 
-### Evaluación de arquitecturas alternativas
+Las siguientes mejoras se encuentran en evaluación:
 
-Además de la arquitectura LSTM actual, se estudiará el desempeño de modelos y arquitecturas basadas en mecanismos de atención para determinar la mejor estrategia de clasificación temporal.
+* Balanceo de clases para Grooming y Desplazamiento.
+* Incorporación de orientación corporal y velocidad angular.
+* Optimización de la arquitectura LSTM.
+* Validación cruzada por video para evaluar capacidad de generalización.
+* Evaluación de nuevas estrategias de extracción de características.
+
+```
+```
 
 
