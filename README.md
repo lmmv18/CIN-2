@@ -95,51 +95,66 @@ Los embeddings se construyen utilizando información derivada de las trayectoria
 
 Los resultados reportados corresponden a una partición por video completo, evitando fuga de información entre los conjuntos de entrenamiento y prueba.
 
-| Métrica                 | Valor  |
-| ----------------------- | ------ |
-| Accuracy                | 43.2 % |
-| Videos de entrenamiento | 51     |
-| Videos de prueba        | 16     |
-| Clases                  | 5      |
+El mejor desempeño obtenido hasta el momento se logró utilizando un escalado global de las características, ajustando el `StandardScaler` únicamente con el conjunto de entrenamiento y aplicándolo posteriormente tanto al entrenamiento como a la prueba.
 
+El conjunto de datos contiene **8648 ventanas temporales**, distribuidas en **51 videos de entrenamiento** y **16 videos de prueba**.
+
+| Métrica                 | Valor   |
+| ----------------------- | ------- |
+| Accuracy                | 58.1 %  |
+| Macro F1-score          | 0.43    |
+| Weighted F1-score       | 0.59    |
+| Videos de entrenamiento | 51      |
+| Videos de prueba        | 16      |
+| Clases                  | 5       |
+| Ventanas totales        | 8648    |
 ## Experimentos realizados
 
 Con el objetivo de mejorar la capacidad de generalización del modelo, se evaluaron distintas estrategias de extracción de características, balanceo de datos y arquitecturas de redes neuronales.
 
 ### Configuración base
 
-La configuración con mejor desempeño observada corresponde a:
+La configuración con mejor desempeño corresponde a:
 
-* Ventana temporal: 45 frames.
-* Arquitectura: LSTM (128, 64).
+* Ventana temporal: **45 frames**
+* Arquitectura: **LSTM (128, 64)**
 * Características:
-
   * Posición relativa.
   * Velocidad.
   * Aceleración.
   * Magnitud de velocidad.
   * Distancias entre puntos corporales.
+* Embeddings generados **sin escalado previo**.
+* Escalado global mediante `StandardScaler`, ajustado únicamente con el conjunto de entrenamiento (`fit` en `X_train` y `transform` en `X_train` y `X_test`).
 
 Desempeño obtenido:
 
-| Métrica  | Valor  |
-| -------- | ------ |
-| Accuracy | 43.2 % |
+| Métrica | Valor |
+|---------|------:|
+| Accuracy | **58.1 %** |
+| Macro F1 | **0.43** |
+| Weighted F1 | **0.59** |
 
-### Experimentos evaluados
-
-| Experimento                         | Resultado                                     |
-| ----------------------------------- | --------------------------------------------- |
-| Incorporación de aceleración        | Mejora observada respecto a versiones previas |
-| Orientación corporal                | No mejoró el desempeño                        |
-| Velocidad angular                   | No mejoró el desempeño                        |
-| Oversampling de clases minoritarias | No mejoró el desempeño global                 |
-| Ventanas temporales de 60 frames    | No mejoró el desempeño                        |
+| Experimento | Resultado |
+|-------------|-----------|
+| Incorporación de aceleración | Mejoró el desempeño respecto a versiones previas. |
+| Orientación corporal | No mejoró el desempeño. |
+| Velocidad angular | No mejoró el desempeño. |
+| Oversampling de clases minoritarias | No produjo mejoras globales. |
+| Ventanas temporales de 60 frames | No mejoró el desempeño. |
+| Arquitectura GRU | Desempeño similar a LSTM. |
+| Eliminación completa del escalado | Incrementó la accuracy, pero redujo considerablemente el desempeño en clases minoritarias. |
+| Escalado global (fit en entrenamiento) | Mejor desempeño global obtenido. |
+| Entrenamiento sin mezclar ventanas (`shuffle=False`) | Disminuyó significativamente el desempeño del modelo. |
 | Arquitectura GRU                    | Desempeño similar al modelo LSTM              |
 
 ### Conclusiones
 
-Los resultados obtenidos sugieren que el principal cuello de botella del sistema no corresponde a la arquitectura recurrente utilizada, ya que tanto LSTM como GRU presentaron desempeños similares.
+Los experimentos realizados muestran que la calidad del preprocesamiento tiene un impacto mayor que la arquitectura recurrente utilizada.
+
+La mejora más importante se obtuvo modificando la estrategia de normalización, utilizando un escalado global ajustado únicamente con el conjunto de entrenamiento, lo que permitió mejorar significativamente la capacidad de generalización del modelo.
+
+Asimismo, se observó que mantener las ventanas ordenadas durante el entrenamiento (`shuffle=False`) deteriora el aprendizaje, mientras que el entrenamiento con mezcla aleatoria de ventanas proporciona una mejor convergencia del optimizador.
 
 Las principales limitaciones identificadas actualmente son:
 
@@ -148,20 +163,19 @@ Las principales limitaciones identificadas actualmente son:
 * Posible variabilidad en el etiquetado manual.
 * Tamaño reducido del conjunto de entrenamiento.
 
-Estos resultados servirán como línea base para futuras evaluaciones de arquitecturas más complejas y nuevas estrategias de extracción de características.
-
 ## Observaciones
 
-La mejora más reciente se obtuvo incorporando características de aceleración derivadas de las trayectorias corporales, aumentando el desempeño del modelo respecto a versiones anteriores.
+Actualmente el mejor desempeño del sistema se obtiene utilizando:
 
-Actualmente el principal reto corresponde al desbalance de clases, especialmente en los comportamientos Grooming y Desplazamiento.
+* Embeddings sin escalado.
+* Escalado global mediante `StandardScaler` ajustado únicamente con el conjunto de entrenamiento.
+* Separación completa de videos entre entrenamiento y prueba.
+* Entrenamiento con mezcla aleatoria de ventanas (`shuffle=True`).
+
+Esta configuración alcanzó una accuracy del **58.1 %**, constituyendo la línea base actual del proyecto.
 
 ## Trabajo futuro
-
-Las siguientes mejoras se encuentran en evaluación:
-
-* Revisión y validación de etiquetas manuales.
-* Incremento del conjunto de entrenamiento para clases minoritarias.
-* Validación cruzada por video para evaluar capacidad de generalización.
-* Evaluación de arquitecturas basadas en mecanismos de atención.
-* Evaluación de nuevas estrategias de extracción de características.
+* Incorporación de mecanismos de atención (Attention).
+* Evaluación de arquitecturas Transformer para series temporales.
+* Evaluación de nuevas estrategias de balanceo de clases.
+* Optimización del tamaño de la ventana temporal y del solapamiento.
