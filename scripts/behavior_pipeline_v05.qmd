@@ -1,0 +1,2551 @@
+---
+title: "Pipeline de clasificación de comportamiento (DLC + LSTM)"
+subtitle: "Proyecto CIN-2 — v04"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    df-print: kable
+execute:
+  eval: false
+jupyter: python3
+---
+
+::: {.callout-note}
+**Cambios v03 → v04** (features, sin tocar DeepLabCut ni la arquitectura LSTM):
+
+1. **Traslación absoluta del centroide** (`centroid_speed`): antes, todas las
+   features de posición/velocidad/aceleración se calculaban sobre
+   coordenadas centradas en el centroide de cada frame, lo cual **cancela
+   cualquier traslación rígida** de la rata (caminar en línea recta sin
+   cambiar de postura). El modelo no tenía ninguna señal directa de
+   desplazamiento por la arena — esto explica gran parte de la confusión
+   Desplazamiento↔Rearing.
+2. **Marco egocéntrico** (`egocentric_transform`): posición/velocidad/
+   aceleración y los ángulos de las patas ahora se rotan para alinear el
+   eje cabeza-cola con el eje X, y se escalan por la longitud corporal.
+   Antes, los ángulos de las patas se calculaban en el marco absoluto de
+   la imagen, por lo que la misma postura tomaba valores distintos según
+   hacia dónde miraba la rata — de ahí que los histogramas no mostraran
+   separación entre clases.
+3. **Normalización por tamaño corporal**: `elongation`, `dist` y
+   `rel_speed` ahora se dividen por la longitud cabeza-cola de cada frame,
+   en vez de quedar en píxeles crudos (esto corrige el rango 0–150 de
+   `elongation` visto en los histogramas, probablemente inflado por
+   diferencias de zoom/distancia entre videos).
+4. **`body_angle` → `body_angular_vel`**: el ángulo absoluto de
+   orientación no es informativo por sí mismo (una rata haciendo grooming
+   mirando al norte o al sur es el mismo comportamiento); se reemplaza por
+   la velocidad angular de giro del cuerpo.
+5. **Rama de estadísticas por ventana ampliada** de 4 a 12 valores:
+   se agregan estadísticas de `centroid_speed`, longitud de trayectoria,
+   desplazamiento neto, razón de rectitud (`straightness`), variabilidad
+   de `elongation` y `body_angular_vel`, y un índice de periodicidad
+   (FFT) sobre `rel_speed` pensado para separar Grooming de Inmovilidad.
+6. **`LABEL_PURITY_THRESHOLD`** configurable (antes hardcodeado en 0.5).
+7. **`STEP_SIZE`** por defecto sube de 2 a 5 para reducir el solapamiento
+   entre ventanas consecutivas (ver sección de experimentos).
+
+La arquitectura LSTM (`train_model`) se deja intacta a propósito: el
+`Input` de la rama de estadísticas ya toma `S_train.shape[1]`
+dinámicamente, así que no requiere cambios para pasar de 4 a 12 columnas.
+:::
+
+## Descripción general
+
+Este documento ejecuta el pipeline completo del proyecto CIN-2:
+
+1. **DeepLabCut**: análisis de video (opcional, controlado por `RUN_DLC`).
+2. **Features**: extracción de posición, velocidad, aceleración, velocidad
+   escalar y distancias entre puntos clave, en ventanas deslizantes.
+3. **Dataset**: construcción de `X_train`/`X_test` a partir de los
+   embeddings/features y las etiquetas de comportamiento.
+4. **Modelo LSTM**: entrenamiento, evaluación y guardado del modelo.
+
+Cada etapa se controla con los flags booleanos en el chunk de
+configuración (`RUN_DLC`, `GENERATE_FEATURES`, `BUILD_DATASET`,
+`TRAIN_MODEL`), igual que en el script original. Corre solo los chunks
+que necesites — no hace falta ejecutar todo el documento de una vez.
+
+::: {.callout-note}
+**Antes de ejecutar**: selecciona el intérprete de tu entorno virtual
+`dlc-clean` como kernel de este documento en VS Code
+(`Ctrl+Shift+P` → "Notebook: Select Notebook Kernel", o el selector de
+intérprete de Python).
+:::
+
+## Imports
+
+```{python}
+import os
+import re
+import joblib
+import deeplabcut
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from collections import Counter
+
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Dropout, BatchNormalization
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras import mixed_precision 
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+```
+
+## Configuración
+
+::: {.callout-important}
+**Ruta base**: a diferencia del script `.py` original, aquí `__file__`
+no existe en un notebook/Quarto interactivo. Por eso `BASE_DIR` se fija
+de forma explícita. Ajusta la ruta si copias este `.qmd` a otro lugar
+del proyecto (debe apuntar a la raíz `CIN-2/`).
+:::
+
+```{python}
+
+BASE_DIR = os.path.dirname(os.getcwd())  # ajustar si es necesario
+
+CONFIG_PATH = os.path.join(
+    BASE_DIR, "dlc_project", "Proyecto1-Laura-2026-04-13", "config.yaml"
+)
+
+VIDEO_FOLDER = os.path.join(BASE_DIR, "videos")
+EMB_FOLDER = os.path.join(BASE_DIR, "features")
+LABELS_FOLDER = os.path.join(BASE_DIR, "labels")
+MODELS_FOLDER = os.path.join(BASE_DIR, "models")
+RESULTS_FOLDER = os.path.join(BASE_DIR, "results")
+
+
+from datetime import datetime
+from uuid import uuid4
+
+# REGISTRO DE EXPERIMENTOS
+
+
+EXPERIMENT_NAME = "v05_train_val_test_focal"
+
+# Identificador único para cada ejecución
+RUN_ID = (
+    f"{EXPERIMENT_NAME}_"
+    f"{datetime.now():%Y%m%d_%H%M%S}_"
+    f"{uuid4().hex[:6]}"
+)
+
+EXPERIMENT_MODELS = os.path.join(
+    MODELS_FOLDER, "experiments", RUN_ID
+)
+
+EXPERIMENT_RESULTS = os.path.join(
+    RESULTS_FOLDER, "experiments", RUN_ID
+)
+
+os.makedirs(EXPERIMENT_MODELS, exist_ok=False)
+os.makedirs(EXPERIMENT_RESULTS, exist_ok=False)
+
+print("Experimento:", RUN_ID)
+print("Modelos:", EXPERIMENT_MODELS)
+print("Resultados:", EXPERIMENT_RESULTS)
+
+TRAIN_SPLIT = os.path.join(BASE_DIR, "scripts", "train_videos.txt")
+TEST_SPLIT = os.path.join(BASE_DIR, "scripts", "test_videos.txt")
+
+WINDOW_SIZE = 45
+STEP_SIZE = 5     
+FPS = 30
+
+
+VAL_SIZE = 0.20
+SPLIT_SEED = 42
+
+
+LABEL_PURITY_THRESHOLD = 0.5  
+RUN_DLC = False
+GENERATE_FEATURES = True
+BUILD_DATASET = True
+TRAIN_MODEL = True
+
+for folder in [MODELS_FOLDER, EMB_FOLDER, RESULTS_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
+
+print("BASE_DIR:", BASE_DIR)
+```
+
+## Etapa 1 — DeepLabCut
+
+Analiza los videos que aún no tengan un `.h5` correspondiente.
+
+```{python}
+def run_dlc():
+    videos_all = [f for f in os.listdir(VIDEO_FOLDER) if f.lower().endswith(".mp4")]
+    videos_to_process = []
+
+    for video_file in videos_all:
+        base_name = os.path.splitext(video_file)[0]
+        h5_exists = any(
+            f.startswith(base_name) and f.endswith(".h5")
+            for f in os.listdir(VIDEO_FOLDER)
+        )
+        if not h5_exists:
+            videos_to_process.append(os.path.join(VIDEO_FOLDER, video_file))
+
+    print(f"Total videos: {len(videos_all)}")
+    print(f"Faltantes: {len(videos_to_process)}")
+
+    if len(videos_to_process) > 0:
+        deeplabcut.analyze_videos(CONFIG_PATH, videos_to_process, save_as_csv=True)
+        deeplabcut.filterpredictions(CONFIG_PATH, videos_to_process)
+        print("Procesamiento DLC completado")
+    else:
+        print("Todos los videos ya fueron procesados")
+```
+
+```{python}
+#if RUN_DLC:
+#    run_dlc()
+```
+
+## Etapa 2 — Extracción de features
+
+Funciones auxiliares para calcular velocidad, aceleración, velocidad
+escalar y matriz de distancias entre puntos clave, y para segmentar en
+ventanas deslizantes.
+
+```{python}
+def compute_velocity(coords):
+    return np.diff(coords, axis=0)
+
+def compute_speed(velocity):
+    return np.linalg.norm(velocity, axis=2)
+
+def compute_distance_matrix(points):
+    n = points.shape[1]
+    dists = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = np.linalg.norm(points[:, i] - points[:, j], axis=1)
+            dists.append(d)
+    return np.stack(dists, axis=1)
+
+def compute_body_elongation(coords, head_idx, tail_idx):
+    """Distancia vertical (eje Y) entre cabeza y cola. Alta en rearing (erguido),
+    baja en desplazamiento/quieto (horizontal)."""
+    return np.abs(coords[:, head_idx, 1] - coords[:, tail_idx, 1])
+
+def compute_body_angle(coords, head_idx, tail_idx):
+    """Ángulo del eje corporal respecto a la horizontal, en radianes.
+    ~pi/2 en rearing, ~0 en desplazamiento normal."""
+    dx = coords[:, head_idx, 0] - coords[:, tail_idx, 0]
+    dy = coords[:, head_idx, 1] - coords[:, tail_idx, 1]
+    return np.arctan2(dy, dx)
+def compute_angle_between_points(coords, idx_a, idx_b):
+    """
+    Ángulo entre dos puntos corporales respecto a la horizontal.
+    Se calcula frame por frame.
+    """
+    dx = coords[:, idx_a, 0] - coords[:, idx_b, 0]
+    dy = coords[:, idx_a, 1] - coords[:, idx_b, 1]
+    return np.arctan2(dy, dx)
+
+def compute_relative_velocity_to_centroid(coords, point_idx):
+    """
+    Velocidad de un punto corporal relativa al centroide de la rata.
+    El centroide se calcula como el promedio de todos los keypoints por frame.
+    """
+    centroid = coords.mean(axis=1)  # (frames, 2)
+    relative_pos = coords[:, point_idx] - centroid
+    rel_vel = np.diff(relative_pos, axis=0)
+    return np.linalg.norm(rel_vel, axis=1)
+
+def compute_relative_velocity(coords, point_idx, reference_idx):
+    """Velocidad de un punto (ej. nariz) relativa a otro punto del cuerpo
+    (ej. Center), en vez de relativa al espacio absoluto. Alta en grooming."""
+    relative_pos = coords[:, point_idx] - coords[:, reference_idx]
+    rel_vel = np.diff(relative_pos, axis=0)
+    return np.linalg.norm(rel_vel, axis=1)
+
+def compute_head_rotation(coords, left_ear_idx, right_ear_idx):
+    """Velocidad de rotación del eje entre orejas — cambios rápidos indican
+    rotación de cabeza (grooming)."""
+    dx = coords[:, left_ear_idx, 0] - coords[:, right_ear_idx, 0]
+    dy = coords[:, left_ear_idx, 1] - coords[:, right_ear_idx, 1]
+    angle = np.arctan2(dy, dx)
+    return np.abs(np.diff(angle))  # velocidad angular (cambio absoluto entre frames)
+
+def egocentric_transform(coords_centered, body_angle, scale):
+    """
+    Rota cada frame para alinear el eje cabeza-cola con el eje X, y
+    escala por la longitud corporal (`scale`).
+
+    Por qué: las coordenadas centradas por sí solas siguen dependiendo de
+    hacia dónde mira la rata en la arena. Dos frames con la MISMA postura
+    relativa (ej. pata izquierda flexionada hacia el pecho durante
+    grooming) producen valores XY totalmente distintos si la rata está
+    orientada de forma distinta. Al rotar cada frame a un eje canónico
+    (cabeza-cola alineado con X) y escalar por el largo corporal, la
+    postura queda comparable entre frames, videos e individuos,
+    independientemente de la orientación absoluta o el tamaño aparente.
+
+    coords_centered: (frames, keypoints, 2), ya centrado en el centroide
+    body_angle: (frames,) ángulo del eje corporal en el marco absoluto
+    scale: (frames,) referencia de tamaño corporal (> 0)
+    """
+    cos_t = np.cos(-body_angle)
+    sin_t = np.sin(-body_angle)
+
+    x = coords_centered[..., 0]
+    y = coords_centered[..., 1]
+
+    x_rot = x * cos_t[:, None] - y * sin_t[:, None]
+    y_rot = x * sin_t[:, None] + y * cos_t[:, None]
+
+    coords_rot = np.stack([x_rot, y_rot], axis=-1)
+    coords_ego = coords_rot / scale[:, None, None]
+
+    return coords_ego
+
+def extract_features(df):
+
+    columns_xy = [
+        c for c in df.columns
+        if c.endswith("_x") or c.endswith("_y")
+    ]
+
+    data = df[columns_xy].values
+
+    if data.shape[1] % 2 != 0:
+        data = data[:, :-1]
+
+    num_keypoints = data.shape[1] // 2
+
+# --- Orden real de keypoints, en el mismo orden que coords ---
+    KNOWN_KEYPOINTS = [
+        'Nose', 'Left_ear', 'Right_ear', 'Spine_1', 'Center', 'Spine_2',
+        'Left_fhip', 'Right_fhip', 'Left_bhip', 'Right_bhip',
+        'Tail_base', 'Tail_1', 'Tail_2', 'Tail_tip'
+    ]
+
+    def match_keypoint(col_name, known_list):
+        base = col_name[:-2]  # quita "_x" o "_y"
+        # ordena por longitud descendente para que "Tail_base" no sea
+        # confundido con un match parcial de otro nombre más corto
+        for kp in sorted(known_list, key=len, reverse=True):
+            if base.endswith(kp):
+                return kp
+        return None
+
+    keypoint_names = []
+    for c in columns_xy:
+        kp = match_keypoint(c, KNOWN_KEYPOINTS)
+        if kp is not None and kp not in keypoint_names:
+            keypoint_names.append(kp)
+
+    coords_raw = data.reshape(len(df), num_keypoints, 2)
+
+    HEAD_IDX = keypoint_names.index("Nose")
+    TAIL_IDX = keypoint_names.index("Tail_base")
+    LEFT_EAR_IDX = keypoint_names.index("Left_ear")
+    RIGHT_EAR_IDX = keypoint_names.index("Right_ear")
+    SPINE_1_IDX = keypoint_names.index("Spine_1")
+    SPINE_2_IDX = keypoint_names.index("Spine_2")
+
+    LEFT_FHIP_IDX = keypoint_names.index("Left_fhip")
+    RIGHT_FHIP_IDX = keypoint_names.index("Right_fhip")
+    LEFT_BHIP_IDX = keypoint_names.index("Left_bhip")
+    RIGHT_BHIP_IDX = keypoint_names.index("Right_bhip")
+
+    # --- Centroide y postura centrada (traslación removida) ---
+    centroid_raw = coords_raw.mean(axis=1)                     # (N, 2)
+    coords_centered = coords_raw - centroid_raw[:, None, :]    # (N, K, 2)
+
+    # --- Ángulo y escala corporal, en el marco absoluto (mundo) ---
+    # OJO: body_angle y elongation deben calcularse en el marco absoluto,
+    # no en el egocéntrico, porque "rearing" es literalmente pararse
+    # respecto al eje vertical de la cámara/mundo, no respecto al propio
+    # eje del cuerpo (que por construcción del marco egocéntrico siempre
+    # queda horizontal).
+    body_angle = compute_body_angle(coords_raw, HEAD_IDX, TAIL_IDX)  # (N,)
+    scale = np.linalg.norm(coords_raw[:, HEAD_IDX] - coords_raw[:, TAIL_IDX], axis=1)
+    scale = np.where(scale < 1e-3, np.nan, scale)
+    scale = pd.Series(scale).interpolate().bfill().ffill().values
+    scale = np.where(np.isnan(scale) | (scale < 1e-3), 1e-3, scale)
+
+    # --- Marco egocéntrico: rotado al eje cabeza-cola + escalado por
+    # tamaño corporal. Position/velocity/acceleration y los ángulos de
+    # las patas se calculan sobre este marco para que sean invariantes a
+    # la orientación absoluta y comparables entre videos/individuos. ---
+    coords_ego = egocentric_transform(coords_centered, body_angle, scale)
+
+    vel = compute_velocity(coords_ego)
+    speed = compute_speed(vel)
+    dist = compute_distance_matrix(coords_ego)   # ya queda en "largos corporales"
+    acc = np.diff(vel, axis=0)
+
+    # --- Traslación absoluta del centroide (NUEVO) ---
+    # Esta es la señal que faltaba en v03: velocidad real de
+    # desplazamiento del animal por la arena. pos/vel/acc/speed/dist se
+    # calculan sobre coordenadas centradas en el centroide, por lo que
+    # una traslación rígida (caminar en línea recta sin cambiar de
+    # postura) se cancela y NO aparecía en ninguna feature. Por eso
+    # Desplazamiento se confundía tanto con Rearing: el modelo no tenía
+    # ninguna señal directa de "me estoy moviendo por el espacio".
+    centroid_vel = np.diff(centroid_raw, axis=0)                # (N-1, 2)
+    centroid_speed_raw = np.linalg.norm(centroid_vel, axis=1)   # (N-1,)
+
+    min_len = min(len(coords_ego), len(vel), len(acc), len(speed), len(dist),
+                   len(centroid_speed_raw))
+
+    pos = coords_ego[:min_len]
+    vel = vel[:min_len]
+    acc = acc[:min_len]
+    speed = speed[:min_len]
+    dist = dist[:min_len]
+    scale_trim = scale[:min_len]
+
+    centroid_speed_raw = centroid_speed_raw[:min_len]
+    centroid_speed = centroid_speed_raw / scale_trim    # en largos corporales / frame
+    centroid_pos = centroid_raw[:min_len]                # para path/desplazamiento por ventana
+
+    pos_flat = pos.reshape(min_len, -1)
+    vel_flat = vel.reshape(min_len, -1)
+    acc_flat = acc.reshape(min_len, -1)
+
+    # ============================================
+    # Postura, orientación y movimiento relativo
+    # ============================================
+    elongation_raw = compute_body_elongation(coords_raw, HEAD_IDX, TAIL_IDX)[:min_len]
+    elongation = elongation_raw / scale_trim   # normalizada (~seno del ángulo de inclinación)
+
+    # velocidad angular de giro corporal, en vez del ángulo absoluto crudo
+    # (la orientación absoluta en la arena no es informativa del
+    # comportamiento; la velocidad de giro sí lo es, ej. para distinguir
+    # caminar recto de reorientarse)
+    body_angle_trim = body_angle[:min_len + 1]
+    body_angular_vel = np.diff(np.unwrap(body_angle_trim))[:min_len]
+
+    rel_speed_raw = compute_relative_velocity_to_centroid(coords_raw, HEAD_IDX)[:min_len]
+    rel_speed = rel_speed_raw / scale_trim
+
+    head_rotation = compute_head_rotation(coords_ego, LEFT_EAR_IDX, RIGHT_EAR_IDX)[:min_len]
+
+    # Ángulos de las patas, ahora relativos al eje corporal (marco
+    # egocéntrico) en vez de al marco absoluto de la imagen.
+    left_front_angle = compute_angle_between_points(
+        coords_ego, LEFT_FHIP_IDX, SPINE_1_IDX
+    )[:min_len]
+
+    right_front_angle = compute_angle_between_points(
+        coords_ego, RIGHT_FHIP_IDX, SPINE_1_IDX
+    )[:min_len]
+
+    left_back_angle = compute_angle_between_points(
+        coords_ego, LEFT_BHIP_IDX, SPINE_2_IDX
+    )[:min_len]
+
+    right_back_angle = compute_angle_between_points(
+        coords_ego, RIGHT_BHIP_IDX, SPINE_2_IDX
+    )[:min_len]
+
+    dist_norm = dist / scale_trim[:, None]
+    overall_speed = speed.mean(axis=1)   # dinámica postural relativa (para stats)
+
+    features_out = np.concatenate([
+        pos_flat,
+        vel_flat,
+        acc_flat,
+        speed,
+        dist_norm,
+        elongation.reshape(-1, 1),
+        body_angular_vel.reshape(-1, 1),
+        rel_speed.reshape(-1, 1),
+        head_rotation.reshape(-1, 1),
+        centroid_speed.reshape(-1, 1),   # NUEVO: traslación absoluta
+
+        # Ángulos de patas por separado (marco egocéntrico)
+        left_front_angle.reshape(-1, 1),
+        right_front_angle.reshape(-1, 1),
+        left_back_angle.reshape(-1, 1),
+        right_back_angle.reshape(-1, 1),
+    ], axis=1)
+
+    extra_signals = {
+        "overall_speed": overall_speed,
+        "centroid_speed": centroid_speed,
+        "centroid_pos": centroid_pos,
+        "elongation": elongation,
+        "body_angular_vel": body_angular_vel,
+        "rel_speed": rel_speed,
+        "scale": scale_trim,
+    }
+
+    return features_out, extra_signals
+
+def compute_window_stats(window_signals):
+    """
+    window_signals: dict con arrays recortados a la ventana actual, con
+    las mismas claves que devuelve extract_features() en extra_signals.
+    """
+    eps = 1e-6
+
+    overall_speed_w = window_signals["overall_speed"]
+    centroid_speed_w = window_signals["centroid_speed"]
+    centroid_pos_w = window_signals["centroid_pos"]
+    elongation_w = window_signals["elongation"]
+    body_angular_vel_w = window_signals["body_angular_vel"]
+    rel_speed_w = window_signals["rel_speed"]
+    scale_w = window_signals["scale"]
+
+    # --- Trayectoria del centroide dentro de la ventana ---
+    # path_length: cuánto "caminó" en total (suma de velocidades).
+    # net_displacement: cuánto se alejó del punto de partida.
+    # straightness = net/path: cerca de 1 = línea recta (desplazamiento),
+    # cerca de 0 = se movió pero volvió cerca de donde empezó (rearing,
+    # grooming con oscilación, ajustes posturales in situ).
+    path_length = np.sum(centroid_speed_w)
+    mean_scale = np.mean(scale_w) if len(scale_w) > 0 else 1.0
+    net_displacement = np.linalg.norm(centroid_pos_w[-1] - centroid_pos_w[0]) / (mean_scale + eps)
+    straightness = net_displacement / (path_length + eps)
+
+    # --- Periodicidad de rel_speed (nariz vs. centroide) ---
+    # El grooming suele tener un patrón rítmico (pasadas repetidas de
+    # pata/hocico) que la inmovilidad no tiene. Un pico de energía
+    # espectral alto respecto al total sugiere movimiento periódico.
+    if len(rel_speed_w) >= 4:
+        centered = rel_speed_w - rel_speed_w.mean()
+        fft_vals = np.abs(np.fft.rfft(centered))
+        total_power = fft_vals.sum() + eps
+        periodicity_ratio = fft_vals.max() / total_power
+    else:
+        periodicity_ratio = 0.0
+
+    return np.array([
+        np.mean(overall_speed_w), np.std(overall_speed_w),
+        np.min(overall_speed_w), np.max(overall_speed_w),
+
+        np.mean(centroid_speed_w), np.std(centroid_speed_w),
+        path_length, net_displacement, straightness,
+
+        np.std(elongation_w),
+        np.std(body_angular_vel_w),
+
+        periodicity_ratio,
+    ])
+
+def create_windows(features, extra_signals):
+    windows = []
+    stats = []
+
+    n = len(features)
+
+    for i in range(0, n - WINDOW_SIZE, STEP_SIZE):
+
+        # Mantener directamente la secuencia temporal:
+        # (45 frames, n_features)
+        window = features[i:i + WINDOW_SIZE]
+        windows.append(window)
+
+        window_signals = {
+            key: value[i:i + WINDOW_SIZE]
+            for key, value in extra_signals.items()
+        }
+        stats.append(compute_window_stats(window_signals))
+
+    return np.array(windows), np.array(stats)
+
+
+
+def generate_features():
+    csv_files = [
+        f for f in os.listdir(VIDEO_FOLDER)
+        if (f.endswith(".csv") and "DLC" in f and "_filtered" in f)
+    ]
+
+    for file in csv_files:
+        try:
+            df = pd.read_csv(os.path.join(VIDEO_FOLDER, file), header=[0, 1, 2])
+            df.columns = ['_'.join(col).strip() for col in df.columns.values]
+        except Exception:
+            continue
+
+        df = df.loc[:, ~df.columns.str.contains("likelihood")]
+        df = df.apply(pd.to_numeric, errors='coerce')
+        df = df.interpolate().bfill().ffill()
+
+        features, extra_signals = extract_features(df)
+        windows, window_stats = create_windows(features, extra_signals)
+
+        base_name = os.path.splitext(file)[0]
+        np.save(os.path.join(EMB_FOLDER, base_name + ".npy"), windows)
+        np.save(os.path.join(EMB_FOLDER, base_name + "_stats.npy"), window_stats)
+
+        print("Features:", file, windows.shape, "| stats:", window_stats.shape)
+```
+
+```{python}
+#if GENERATE_FEATURES:
+#    generate_features()
+```
+
+## Utilidades
+
+```{python}
+def clean_name(name):
+    name = name.lower()
+    name = re.sub(r"dlc.*", "", name)
+    name = name.replace(" ", "").replace("-", "").replace("_", "")
+    return name
+
+def load_split_file(path):
+    with open(path, "r") as f:
+        return {line.strip().lower() for line in f if line.strip()}
+
+def read_csv_safe(path):
+    try:
+        return pd.read_csv(path, sep=";")
+    except Exception:
+        return pd.read_csv(path, sep=";", encoding="latin-1")
+
+def expand_time_to_frames(df):
+    df = df.dropna(axis=1, how='all')
+    times = df.iloc[:, 0].values
+    labels = df.iloc[:, 1].values
+
+    frame_labels = []
+    for i in range(len(df) - 1):
+        t1 = float(str(times[i]).replace(",", "."))
+        t2 = float(str(times[i + 1]).replace(",", "."))
+        label = str(labels[i])
+        duration = t2 - t1
+        n_frames = int(duration * FPS)
+        frame_labels.extend([label] * n_frames)
+
+    return np.array(frame_labels)
+```
+
+## Etapa 3 — Construcción del dataset
+
+Empareja cada archivo de features (`.npy`) con su CSV de etiquetas
+correspondiente, asigna una etiqueta por ventana (mayoría >50%, si no
+`"mixed"`), y separa en train/test según `train_videos.txt` /
+`test_videos.txt`.
+
+```{python}
+def build_dataset():
+       
+    train_ids_original = sorted(
+        load_split_file(TRAIN_SPLIT)
+    )
+
+    test_ids = load_split_file(TEST_SPLIT)
+
+    train_ids_list, val_ids_list = train_test_split(
+        train_ids_original,
+        test_size=VAL_SIZE,
+        random_state=SPLIT_SEED,
+        shuffle=True
+    )
+
+    train_ids = set(train_ids_list)
+    val_ids = set(val_ids_list)
+
+    print("==========================================")
+    print("SPLIT POR VIDEO")
+    print("==========================================")
+    print("TRAIN:", len(train_ids))
+    print("VALIDATION:", len(val_ids))
+    print("TEST:", len(test_ids))
+
+    # Comprobación de que ningún video aparece en dos grupos
+    assert train_ids.isdisjoint(val_ids)
+    assert train_ids.isdisjoint(test_ids)
+    assert val_ids.isdisjoint(test_ids)
+
+    print("Sin solapamiento entre grupos.")
+
+
+        # ==========================================
+    # GUARDAR SPLIT PARA REPRODUCIBILIDAD
+    # ==========================================
+
+    SPLIT_OUTPUT_FOLDER = os.path.join(
+        BASE_DIR,
+        "scripts",
+        "splits_v05"
+    )
+
+    os.makedirs(
+        SPLIT_OUTPUT_FOLDER,
+        exist_ok=True
+    )
+
+    with open(
+        os.path.join(
+            SPLIT_OUTPUT_FOLDER,
+            "train_videos_v05.txt"
+        ),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        for video in sorted(train_ids):
+            f.write(video + "\n")
+
+    with open(
+        os.path.join(
+            SPLIT_OUTPUT_FOLDER,
+            "val_videos_v05.txt"
+        ),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        for video in sorted(val_ids):
+            f.write(video + "\n")
+
+    with open(
+        os.path.join(
+            SPLIT_OUTPUT_FOLDER,
+            "test_videos_v05.txt"
+        ),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        for video in sorted(test_ids):
+            f.write(video + "\n")
+
+
+
+    emb_files = [
+        f for f in os.listdir(EMB_FOLDER)
+        if f.endswith(".npy") and not f.endswith("_stats.npy")
+    ]
+    label_files = [f for f in os.listdir(LABELS_FOLDER) if f.endswith(".csv")]
+    label_map = {clean_name(f): f for f in label_files}
+
+    X_train_all, S_train_all, y_train_all = [], [], []
+
+    X_val_all, S_val_all, y_val_all = [], [], []
+
+    X_test_all, S_test_all, y_test_all = [], [], []
+
+    test_video_ids_all = []
+    test_starts_all = []
+
+    for emb_file in emb_files:
+        emb_clean = clean_name(os.path.splitext(emb_file)[0])
+
+        matched_label = None
+        video_id = None
+        for key in label_map:
+            if key in emb_clean or emb_clean in key:
+                matched_label = label_map[key]
+                video_id = clean_name(os.path.splitext(emb_file)[0])
+                break
+
+        if matched_label is None:
+            print("NO MATCH:", emb_clean)
+            continue
+
+        X = np.load(os.path.join(EMB_FOLDER, emb_file))
+
+        stats_file = os.path.splitext(emb_file)[0] + "_stats.npy"
+        S = np.load(os.path.join(EMB_FOLDER, stats_file))
+
+        df = read_csv_safe(os.path.join(LABELS_FOLDER, matched_label))
+        frame_labels = expand_time_to_frames(df)
+
+        window_labels = []
+        for i in range(len(X)):
+            start = i * STEP_SIZE
+            end = start + WINDOW_SIZE
+            window = frame_labels[start:end]
+
+            if len(window) == 0:
+                window_labels.append("unknown")
+                continue
+
+            counts = Counter(window)
+            label, freq = counts.most_common(1)[0]
+            window_labels.append(
+                label if freq / len(window) >= LABEL_PURITY_THRESHOLD else "mixed"
+            )
+
+        window_labels = np.array(window_labels)
+        mask = (
+            (window_labels != "mixed")
+            & (window_labels != "unknown")
+            & (window_labels != "nan")
+        )
+
+        video_data = X[mask]
+        video_stats = S[mask]
+        video_labels = window_labels[mask]
+
+        if video_id in train_ids:
+
+            X_train_all.append(video_data)
+            S_train_all.append(video_stats)
+            y_train_all.append(video_labels)
+
+        elif video_id in val_ids:
+
+            X_val_all.append(video_data)
+            S_val_all.append(video_stats)
+            y_val_all.append(video_labels)
+
+        elif video_id in test_ids:
+
+            X_test_all.append(video_data)
+            S_test_all.append(video_stats)
+            y_test_all.append(video_labels)
+
+            test_video_ids_all.append(
+                np.full(len(video_data), video_id)
+            )
+
+            starts = np.arange(len(X)) * STEP_SIZE
+
+            test_starts_all.append(
+                starts[mask]
+            )
+    print("\nResumen:")
+    print("Videos train encontrados:", len(X_train_all))
+    print("Videos val encontrados :", len(X_val_all))
+    print("Videos test encontrados :", len(X_test_all))
+
+    if len(X_train_all) == 0:
+        raise ValueError("No se encontraron videos de entrenamiento")
+
+    if len(X_val_all) == 0:
+        raise ValueError("No se encontraron videos de validación")
+
+    if len(X_test_all) == 0:
+        raise ValueError("No se encontraron videos de prueba")
+
+    # ==========================================
+    # TRAIN
+    # ==========================================
+
+    X_train_all = np.vstack(X_train_all)
+    S_train_all = np.vstack(S_train_all)
+    y_train_all = np.concatenate(y_train_all)
+
+    # ==========================================
+    # VALIDATION
+    # ==========================================
+
+    X_val_all = np.vstack(X_val_all)
+    S_val_all = np.vstack(S_val_all)
+    y_val_all = np.concatenate(y_val_all)
+
+    # ==========================================
+    # TEST
+    # ==========================================
+
+    X_test_all = np.vstack(X_test_all)
+    S_test_all = np.vstack(S_test_all)
+    y_test_all = np.concatenate(y_test_all)
+
+    print("\n===== TRAIN =====")
+    print(Counter(y_train_all))
+
+    print("\n===== VALIDATION =====")
+    print(Counter(y_val_all))
+
+    print("\n===== TEST =====")
+    print(Counter(y_test_all))
+
+
+    np.save(
+        os.path.join(BASE_DIR, "X_train.npy"),
+        X_train_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "S_train.npy"),
+        S_train_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "y_train.npy"),
+        y_train_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "X_val.npy"),
+        X_val_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "S_val.npy"),
+        S_val_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "y_val.npy"),
+        y_val_all
+    )
+
+
+    np.save(
+        os.path.join(BASE_DIR, "X_test.npy"),
+        X_test_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "S_test.npy"),
+        S_test_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "y_test.npy"),
+        y_test_all
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "video_ids_test.npy"),
+        np.concatenate(test_video_ids_all)
+    )
+
+    np.save(
+        os.path.join(BASE_DIR, "window_starts_test.npy"),
+        np.concatenate(test_starts_all)
+    )
+
+    print("\n===== DATASET FINAL =====")
+
+    print(
+        "X_train:",
+        X_train_all.shape,
+        "| S_train:",
+        S_train_all.shape,
+        "| y_train:",
+        y_train_all.shape
+    )
+
+    print(
+        "X_val  :",
+        X_val_all.shape,
+        "| S_val:",
+        S_val_all.shape,
+        "| y_val:",
+        y_val_all.shape
+    )
+
+    print(
+        "X_test :",
+        X_test_all.shape,
+        "| S_test:",
+        S_test_all.shape,
+        "| y_test:",
+        y_test_all.shape
+    )
+```
+```{python}
+import shutil
+
+BACKUP_DIR = os.path.join(
+    BASE_DIR, "backups", f"dataset_pre_{RUN_ID}"
+)
+
+os.makedirs(BACKUP_DIR, exist_ok=False)
+
+files_to_backup = [
+    "X_train.npy",
+    "S_train.npy",
+    "y_train.npy",
+    "X_test.npy",
+    "S_test.npy",
+    "y_test.npy"
+]
+
+for filename in files_to_backup:
+    source = os.path.join(BASE_DIR, filename)
+
+    if os.path.exists(source):
+        shutil.copy2(
+            source,
+            os.path.join(BACKUP_DIR, filename)
+        )
+
+print("Respaldo guardado en:", BACKUP_DIR)
+```
+```{python}
+build_dataset()
+```
+```{python}
+video_ids = np.load(
+    os.path.join(BASE_DIR, "video_ids_test.npy")
+)
+
+window_starts = np.load(
+    os.path.join(BASE_DIR, "window_starts_test.npy")
+)
+
+X_test = np.load(
+    os.path.join(BASE_DIR, "X_test.npy")
+)
+
+print("Videos:", video_ids.shape)
+print("Inicios de ventanas:", window_starts.shape)
+print("X_test:", X_test.shape)
+
+assert len(video_ids) == len(window_starts) == len(X_test)
+
+print("VERIFICACIÓN EXITOSA")
+```
+```{python}
+video_ids = np.load(
+    os.path.join(BASE_DIR, "video_ids_test.npy")
+)
+
+window_starts = np.load(
+    os.path.join(BASE_DIR, "window_starts_test.npy")
+)
+
+X_test = np.load(
+    os.path.join(BASE_DIR, "X_test.npy")
+)
+
+y_test = np.load(
+    os.path.join(BASE_DIR, "y_test.npy")
+)
+
+print("Video IDs:", video_ids.shape)
+print("Window starts:", window_starts.shape)
+print("X_test:", X_test.shape)
+print("y_test:", y_test.shape)
+print("Videos únicos:", len(np.unique(video_ids)))
+
+assert len(video_ids) == len(window_starts) == len(X_test) == len(y_test)
+assert len(np.unique(video_ids)) == 16
+assert np.all(window_starts >= 0)
+
+print("\nVERIFICACIÓN EXITOSA")
+```
+
+## Etapa 4 — Modelo LSTM
+
+Entrena un LSTM de 2 capas con normalización, dropout y class weights
+balanceados. Guarda el modelo, el label encoder y la matriz de
+confusión en `results/`.
+
+
+```{python}
+def train_model():
+    import random
+    import tensorflow as tf
+    from tensorflow.keras import mixed_precision
+    from tensorflow.keras.layers import Input, Concatenate
+    from tensorflow.keras.models import Model
+
+    
+    import json
+
+    TRAIN_RUN_ID = (
+        f"run_{datetime.now():%Y%m%d_%H%M%S}_"
+        f"{uuid4().hex[:6]}"
+    )
+
+    RUN_MODELS = os.path.join(
+        EXPERIMENT_MODELS,
+        TRAIN_RUN_ID
+    )
+
+    RUN_RESULTS = os.path.join(
+        EXPERIMENT_RESULTS,
+        TRAIN_RUN_ID
+    )
+
+    os.makedirs(RUN_MODELS, exist_ok=False)
+    os.makedirs(RUN_RESULTS, exist_ok=False)
+
+    print("Entrenamiento:", TRAIN_RUN_ID)
+    print("Resultados:", RUN_RESULTS)
+    print("Modelo:", RUN_MODELS)
+
+    np.random.seed(42)
+    random.seed(42)
+    tf.random.set_seed(42)
+
+    mixed_precision.set_global_policy('mixed_float16')
+    tf.config.optimizer.set_jit(True)
+
+    X_train = np.load(os.path.join(BASE_DIR, "X_train.npy"))
+    S_train = np.load(os.path.join(BASE_DIR, "S_train.npy"))
+    y_train = np.load(os.path.join(BASE_DIR, "y_train.npy"))
+
+    X_val = np.load(os.path.join(BASE_DIR, "X_val.npy"))
+    S_val = np.load(os.path.join(BASE_DIR, "S_val.npy"))
+    y_val = np.load(os.path.join(BASE_DIR, "y_val.npy"))
+
+    X_test = np.load(os.path.join(BASE_DIR, "X_test.npy"))
+    S_test = np.load(os.path.join(BASE_DIR, "S_test.npy"))
+    y_test = np.load(os.path.join(BASE_DIR, "y_test.npy"))
+
+
+    scaler = StandardScaler()
+
+    n_train, timesteps, n_features = X_train.shape
+    n_val = X_val.shape[0]
+    n_test = X_test.shape[0]
+
+    # Pasar temporalmente a 2D para StandardScaler
+    X_train_2d = X_train.reshape(-1, n_features)
+    X_val_2d = X_val.reshape(-1, n_features)
+    X_test_2d = X_test.reshape(-1, n_features)
+
+    # IMPORTANTE:
+    # el scaler aprende ÚNICAMENTE de TRAIN
+    X_train_2d = scaler.fit_transform(X_train_2d)
+
+    # Validation y Test solo se transforman
+    X_val_2d = scaler.transform(X_val_2d)
+    X_test_2d = scaler.transform(X_test_2d)
+
+    # Recuperar forma temporal 3D
+    X_train = X_train_2d.reshape(
+        n_train, timesteps, n_features
+    )
+
+    X_val = X_val_2d.reshape(
+        n_val, timesteps, n_features
+    )
+
+    X_test = X_test_2d.reshape(
+        n_test, timesteps, n_features
+    )
+
+
+    stats_scaler = StandardScaler()
+
+    # Aprende únicamente de TRAIN
+    S_train = stats_scaler.fit_transform(S_train)
+
+    # Solo transformar validation y test
+    S_val = stats_scaler.transform(S_val)
+    S_test = stats_scaler.transform(S_test)
+
+
+    print("\nTRAIN:")
+    print(Counter(y_train))
+
+    print("\nVALIDATION:")
+    print(Counter(y_val))
+
+    print("\nTEST:")
+    print(Counter(y_test))
+
+    y_train = np.array([
+        str(label).strip()
+        for label in y_train
+    ])
+
+    y_val = np.array([
+        str(label).strip()
+        for label in y_val
+    ])
+
+    y_test = np.array([
+        str(label).strip()
+        for label in y_test
+    ])
+
+    # ==========================================
+    # LABEL ENCODER: AJUSTAR SOLO CON TRAIN
+    # ==========================================
+
+    le = LabelEncoder()
+    le.fit(y_train)
+
+    # Verificar que validation/test no tengan
+    # comportamientos inexistentes en train
+    unknown_val = set(y_val) - set(le.classes_)
+    unknown_test = set(y_test) - set(le.classes_)
+
+    if unknown_val:
+        raise ValueError(
+            f"Clases de validation ausentes en train: {unknown_val}"
+        )
+
+    if unknown_test:
+        raise ValueError(
+            f"Clases de test ausentes en train: {unknown_test}"
+        )
+
+    y_train_enc = le.transform(y_train)
+    y_val_enc = le.transform(y_val)
+    y_test_enc = le.transform(y_test)
+
+
+
+    n_classes = len(le.classes_)
+
+    y_train_cat = to_categorical(
+        y_train_enc,
+        num_classes=n_classes
+    )
+
+    y_val_cat = to_categorical(
+        y_val_enc,
+        num_classes=n_classes
+    )
+
+    y_test_cat = to_categorical(
+        y_test_enc,
+        num_classes=n_classes
+    )
+    weights = compute_class_weight(
+        class_weight="balanced", classes=np.unique(y_train_enc), y=y_train_enc
+    )
+
+   
+    CLASS_WEIGHT_MODE = "balanced"       # "balanced" | "sqrt_balanced" | "none"
+    LOSS_MODE = "focal"  # "categorical_crossentropy" | "focal"  <-- default actualizado
+    FOCAL_GAMMA = 2.0
+
+    if CLASS_WEIGHT_MODE == "balanced":
+        class_weights = dict(enumerate(weights))
+    elif CLASS_WEIGHT_MODE == "sqrt_balanced":
+        class_weights = dict(enumerate(np.sqrt(weights)))
+    else:
+        class_weights = None
+
+    def make_focal_loss(alpha=None, gamma=2.0):
+        alpha_tensor = None if alpha is None else tf.constant(alpha, dtype=tf.float32)
+
+        def loss(y_true, y_pred):
+            y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+            ce = -y_true * tf.math.log(y_pred)
+            focal_weight = tf.pow(1 - y_pred, gamma)
+            if alpha_tensor is not None:
+                focal_weight = focal_weight * alpha_tensor
+            return tf.reduce_sum(focal_weight * ce, axis=-1)
+        return loss
+
+    timesteps = X_train.shape[1]
+    features = X_train.shape[2]
+
+    print("Entrada LSTM:", X_train.shape)
+    print("Timesteps:", timesteps)
+    print("Features por frame:", features)
+
+    # --- Arquitectura de dos ramas ---
+    seq_input = Input(shape=(timesteps, features), name="sequence_input")
+    x = LSTM(128, return_sequences=True)(seq_input)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+    x = LSTM(64)(x)
+    x = BatchNormalization()(x)
+    x = Dropout(0.4)(x)
+
+    stats_input = Input(shape=(S_train.shape[1],), name="stats_input")
+    s = Dense(16, activation='relu')(stats_input)
+    s = Dropout(0.2)(s)
+
+    combined = Concatenate()([x, s])
+    combined = Dense(64, activation='relu')(combined)
+    combined = Dropout(0.3)(combined)
+    output = Dense(len(le.classes_), activation='softmax', dtype='float32')(combined)
+
+    model = Model(inputs=[seq_input, stats_input], outputs=output)
+
+    print("=" * 60)
+    print(f"CONFIG ACTIVA -> CLASS_WEIGHT_MODE={CLASS_WEIGHT_MODE!r}  LOSS_MODE={LOSS_MODE!r}")
+    if LOSS_MODE == "focal":
+        print(f"  focal gamma={FOCAL_GAMMA}, alpha=sqrt_balanced")
+    else:
+        print(f"  class_weight aplicado en fit(): {class_weights}")
+    print("=" * 60)
+
+    if LOSS_MODE == "focal":
+        # alpha ya pondera por clase (sqrt_balanced) -- si se usa focal,
+        # NO pasar ademas class_weight en model.fit() para no aplicar el
+        # ajuste por desbalance dos veces.
+        alpha_vec = np.sqrt(weights)
+        model.compile(optimizer="adam", loss=make_focal_loss(alpha=alpha_vec, gamma=FOCAL_GAMMA),
+                      metrics=["accuracy"])
+        fit_class_weight = None
+    else:
+        model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+        fit_class_weight = class_weights
+
+    history = model.fit(
+        [X_train, S_train], y_train_cat,
+        epochs=50,
+        batch_size=256,
+        validation_data=(
+            [X_val, S_val],
+            y_val_cat
+        ),
+        callbacks=[
+            EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True),
+            ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5),
+        ],
+        class_weight=fit_class_weight,
+        shuffle=True,
+    )
+
+       # ==========================================
+    # EVALUACIÓN RAW
+    # ==========================================
+
+    loss, acc = model.evaluate(
+        [X_test, S_test],
+        y_test_cat
+    )
+
+    print("\nAccuracy FINAL:", acc)
+
+    y_pred_probs = model.predict([X_test, S_test])
+
+    y_pred_classes = np.argmax(y_pred_probs, axis=1)
+    y_true = np.argmax(y_test_cat, axis=1)
+
+    labels_idx = np.arange(len(le.classes_))
+
+    report_raw = classification_report(
+        y_true,
+        y_pred_classes,
+        labels=labels_idx,
+        target_names=le.classes_,
+        zero_division=0
+    )
+
+    print("\n===== RESULTADOS RAW =====")
+    print(report_raw)
+
+    # ==========================================
+    # GUARDAR CLASSIFICATION REPORT
+    # ==========================================
+
+    with open(
+        os.path.join(RUN_RESULTS, "classification_report_raw.txt"),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        f.write(report_raw)
+
+    # ==========================================
+    # MATRIZ DE CONFUSIÓN RAW
+    # ==========================================
+
+    cm = confusion_matrix(
+        y_true,
+        y_pred_classes,
+        labels=labels_idx
+    )
+
+    cm_percent = np.divide(
+        cm.astype(float),
+        cm.sum(axis=1, keepdims=True),
+        out=np.zeros_like(cm, dtype=float),
+        where=cm.sum(axis=1, keepdims=True) != 0
+    ) * 100
+
+    plt.figure(figsize=(10, 8))
+
+    sns.heatmap(
+        cm_percent,
+        annot=True,
+        fmt=".1f",
+        cmap="Blues",
+        xticklabels=le.classes_,
+        yticklabels=le.classes_
+    )
+
+    plt.xlabel("Predicho")
+    plt.ylabel("Real")
+    plt.title("Matriz de confusión RAW (%)")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(RUN_RESULTS, "confusion_matrix_raw.png"),
+        dpi=300
+    )
+
+    plt.show()
+    plt.close()
+
+    # Guardar también la matriz numérica
+    np.save(
+        os.path.join(RUN_RESULTS, "confusion_matrix_raw.npy"),
+        cm
+    )
+
+    # ==========================================
+    # GUARDAR HISTORIAL DEL ENTRENAMIENTO
+    # ==========================================
+
+    history_df = pd.DataFrame(history.history)
+
+    history_df.to_csv(
+        os.path.join(RUN_RESULTS, "training_history.csv"),
+        index=False
+    )
+
+    # ==========================================
+    # GUARDAR PREDICCIONES RAW
+    # ==========================================
+
+    # Se utilizarán después para aplicar los filtros temporales
+    # sin tener que volver a entrenar la LSTM.
+
+    np.save(
+        os.path.join(RUN_RESULTS, "y_pred_probs_test.npy"),
+        y_pred_probs
+    )
+
+    np.save(
+        os.path.join(RUN_RESULTS, "y_pred_raw_test.npy"),
+        y_pred_classes
+    )
+
+    np.save(
+        os.path.join(RUN_RESULTS, "y_true_test.npy"),
+        y_true
+    )
+        # ==========================================
+    # METADATOS TEMPORALES DEL EXPERIMENTO
+    # ==========================================
+
+    video_ids = np.load(
+        os.path.join(BASE_DIR, "video_ids_test.npy")
+    )
+
+    window_starts = np.load(
+        os.path.join(BASE_DIR, "window_starts_test.npy")
+    )
+
+    if not (
+        len(video_ids)
+        == len(window_starts)
+        == len(y_true)
+        == len(y_pred_classes)
+    ):
+        raise ValueError(
+            "Los metadatos temporales no coinciden con las predicciones."
+        )
+
+    np.save(
+        os.path.join(RUN_RESULTS, "video_ids_test.npy"),
+        video_ids
+    )
+
+    np.save(
+        os.path.join(RUN_RESULTS, "window_starts_test.npy"),
+        window_starts
+    )
+    # ==========================================
+    # GUARDAR INFORMACIÓN DEL EXPERIMENTO
+    # ==========================================
+
+    experiment_info = {
+        "experiment_name": EXPERIMENT_NAME,
+        "run_id": RUN_ID,
+        "training_run_id": TRAIN_RUN_ID,
+
+        "window_size": int(WINDOW_SIZE),
+        "step_size": int(STEP_SIZE),
+        "fps": int(FPS),
+        "label_purity_threshold": float(LABEL_PURITY_THRESHOLD),
+
+        "validation_size": float(VAL_SIZE),
+        "split_seed": int(SPLIT_SEED),
+
+        "class_weight_mode": CLASS_WEIGHT_MODE,
+        "loss_mode": LOSS_MODE,
+        "focal_gamma": float(FOCAL_GAMMA),
+
+        "X_train_shape": list(X_train.shape),
+        "S_train_shape": list(S_train.shape),
+
+        "X_val_shape": list(X_val.shape),
+        "S_val_shape": list(S_val.shape),
+
+        "X_test_shape": list(X_test.shape),
+        "S_test_shape": list(S_test.shape),
+
+        "n_train_videos": 40,
+        "n_val_videos": 11,
+        "n_test_videos_usable": 16,
+
+        "classes": le.classes_.tolist(),
+
+        "accuracy_raw": float(acc),
+        "loss_raw": float(loss)
+    }
+    with open(
+        os.path.join(RUN_RESULTS, "experiment_info.json"),
+        "w",
+        encoding="utf-8"
+    ) as f:
+        json.dump(
+            experiment_info,
+            f,
+            indent=4,
+            ensure_ascii=False
+        )
+
+    # ==========================================
+    # GUARDAR MODELO Y SCALERS
+    # ==========================================
+
+    model.save(
+        os.path.join(RUN_MODELS, "lstm_model.keras")
+    )
+
+    joblib.dump(
+        le,
+        os.path.join(RUN_MODELS, "label_encoder.pkl")
+    )
+
+    joblib.dump(
+        scaler,
+        os.path.join(RUN_MODELS, "scaler.pkl")
+    )
+
+    joblib.dump(
+        stats_scaler,
+        os.path.join(RUN_MODELS, "stats_scaler.pkl")
+    )
+
+    print("\nModelo y resultados guardados correctamente.")
+    print("Modelo:", RUN_MODELS)
+    print("Resultados:", RUN_RESULTS)
+```
+
+```{python}
+train_model()
+```
+```{python}
+
+
+X_train_check = np.load(
+    os.path.join(BASE_DIR, "X_train.npy")
+)
+
+X_val_check = np.load(
+    os.path.join(BASE_DIR, "X_val.npy")
+)
+
+X_test_check = np.load(
+    os.path.join(BASE_DIR, "X_test.npy")
+)
+
+print("TRAIN:", X_train_check.shape)
+print("VAL  :", X_val_check.shape)
+print("TEST :", X_test_check.shape)
+
+assert X_train_check.shape[0] == 15366
+assert X_val_check.shape[0] == 4062
+assert X_test_check.shape[0] == 6466
+
+print("\nSPLIT LISTO PARA ENTRENAMIENTO")
+
+```
+## Etapa 5 — Postprocesamiento temporal
+
+
+
+La LSTM genera una predicción por ventana de 45 frames.
+
+Se implementa un filtro de consistencia temporal para evaluar
+si la corrección de predicciones aisladas mejora la clasificación.
+
+El filtro se aplica únicamente a ventanas consecutivas del mismo
+video. No altera los pesos de la red neuronal y permite comparar
+las predicciones originales (RAW) con las suavizadas (SMOOTHED).
+
+```{python}
+
+def smooth_temporal_predictions(
+    predictions,
+    video_ids,
+    window_starts,
+    step_size
+):
+    """
+    Corrige predicciones aisladas únicamente cuando:
+
+    1. Las ventanas pertenecen al mismo video.
+    2. Sus posiciones temporales son consecutivas.
+    3. La predicción anterior y posterior coinciden.
+    4. La predicción central es diferente.
+
+    No modifica el modelo ni las probabilidades originales.
+    """
+
+    predictions = np.asarray(predictions)
+    video_ids = np.asarray(video_ids)
+    window_starts = np.asarray(window_starts)
+
+    smoothed = predictions.copy()
+
+    for video in np.unique(video_ids):
+
+        indices = np.where(video_ids == video)[0]
+
+        # Ordenar por posición temporal
+        indices = indices[
+            np.argsort(window_starts[indices])
+        ]
+
+        for j in range(1, len(indices) - 1):
+
+            prev_idx = indices[j - 1]
+            curr_idx = indices[j]
+            next_idx = indices[j + 1]
+
+            # No atravesar huecos causados por ventanas descartadas
+            contiguous = (
+                window_starts[curr_idx] - window_starts[prev_idx]
+                == step_size
+                and
+                window_starts[next_idx] - window_starts[curr_idx]
+                == step_size
+            )
+
+            if not contiguous:
+                continue
+
+            # Corregir únicamente una predicción aislada
+            if (
+                predictions[prev_idx] == predictions[next_idx]
+                and predictions[curr_idx] != predictions[prev_idx]
+            ):
+                smoothed[curr_idx] = predictions[prev_idx]
+
+    return smoothed
+
+```
+
+## Etapa 6 — Comparación de filtros temporales
+
+Se evalúan dos estrategias adicionales de postprocesamiento:
+
+1. Mayoría de 5 ventanas consecutivas.
+2. Suavizado de las probabilidades Softmax en 5 ventanas.
+
+Ambos filtros trabajan únicamente dentro del mismo video y no atraviesan
+huecos temporales producidos por ventanas descartadas.
+
+El modelo LSTM no se vuelve a entrenar.
+```{python}
+def majority_filter_5(
+    predictions,
+    video_ids,
+    window_starts,
+    step_size
+):
+    """
+    Filtro de mayoría usando 5 ventanas consecutivas.
+
+    Para cada ventana central se consideran:
+        t-2, t-1, t, t+1, t+2
+
+    Si una clase aparece al menos 3 veces, la ventana central
+    recibe esa clase.
+
+    Solo se aplica cuando las 5 ventanas:
+    - pertenecen al mismo video
+    - son temporalmente consecutivas
+    """
+
+    predictions = np.asarray(predictions)
+    video_ids = np.asarray(video_ids)
+    window_starts = np.asarray(window_starts)
+
+    filtered = predictions.copy()
+
+    for video in np.unique(video_ids):
+
+        indices = np.where(video_ids == video)[0]
+
+        indices = indices[
+            np.argsort(window_starts[indices])
+        ]
+
+        for j in range(2, len(indices) - 2):
+
+            local_idx = indices[j - 2:j + 3]
+
+            starts = window_starts[local_idx]
+
+            # Comprobar continuidad temporal
+            if not np.all(np.diff(starts) == step_size):
+                continue
+
+            local_predictions = predictions[local_idx]
+
+            values, counts = np.unique(
+                local_predictions,
+                return_counts=True
+            )
+
+            winner = values[np.argmax(counts)]
+            winner_count = np.max(counts)
+
+            if winner_count >= 3:
+                filtered[indices[j]] = winner
+
+    return filtered
+
+```
+```{python}
+def probability_smoothing_5(
+    probabilities,
+    predictions,
+    video_ids,
+    window_starts,
+    step_size
+):
+    """
+    Suaviza las probabilidades Softmax utilizando 5 ventanas
+    consecutivas del mismo video.
+
+    Para la ventana central se calcula el promedio de las
+    probabilidades de:
+
+        t-2, t-1, t, t+1, t+2
+
+    La clase final es la de mayor probabilidad promedio.
+
+    Las ventanas de los extremos y aquellas cercanas a huecos
+    temporales permanecen sin modificar.
+    """
+
+    probabilities = np.asarray(probabilities)
+    predictions = np.asarray(predictions)
+
+    video_ids = np.asarray(video_ids)
+    window_starts = np.asarray(window_starts)
+
+    filtered = predictions.copy()
+
+    for video in np.unique(video_ids):
+
+        indices = np.where(video_ids == video)[0]
+
+        indices = indices[
+            np.argsort(window_starts[indices])
+        ]
+
+        for j in range(2, len(indices) - 2):
+
+            local_idx = indices[j - 2:j + 3]
+
+            starts = window_starts[local_idx]
+
+            if not np.all(np.diff(starts) == step_size):
+                continue
+
+            mean_probabilities = probabilities[
+                local_idx
+            ].mean(axis=0)
+
+            filtered[indices[j]] = np.argmax(
+                mean_probabilities
+            )
+
+    return filtered
+
+    
+```
+```{python}
+def evaluate_additional_temporal_filters(run_results):
+
+    import json
+
+    # ==========================================
+    # CARGAR RESULTADOS DE LA MISMA LSTM
+    # ==========================================
+
+    y_true = np.load(
+        os.path.join(run_results, "y_true_test.npy")
+    )
+
+    y_pred_raw = np.load(
+        os.path.join(run_results, "y_pred_raw_test.npy")
+    )
+
+    y_pred_probs = np.load(
+        os.path.join(run_results, "y_pred_probs_test.npy")
+    )
+
+    video_ids = np.load(
+        os.path.join(run_results, "video_ids_test.npy")
+    )
+
+    window_starts = np.load(
+        os.path.join(run_results, "window_starts_test.npy")
+    )
+
+    with open(
+        os.path.join(run_results, "experiment_info.json"),
+        "r",
+        encoding="utf-8"
+    ) as f:
+        info = json.load(f)
+
+    classes = np.array(info["classes"])
+    step_size = int(info["step_size"])
+
+    # ==========================================
+    # FILTROS
+    # ==========================================
+
+    y_pred_majority5 = majority_filter_5(
+        y_pred_raw,
+        video_ids,
+        window_starts,
+        step_size
+    )
+
+    y_pred_prob5 = probability_smoothing_5(
+        y_pred_probs,
+        y_pred_raw,
+        video_ids,
+        window_starts,
+        step_size
+    )
+
+    predictions_to_compare = {
+        "RAW": y_pred_raw,
+        "MAJORITY_5": y_pred_majority5,
+        "PROB_SMOOTH_5": y_pred_prob5
+    }
+
+    labels_idx = np.arange(len(classes))
+
+    summary_rows = []
+
+    # ==========================================
+    # EVALUAR CADA MÉTODO
+    # ==========================================
+
+    for name, predictions in predictions_to_compare.items():
+
+        print("\n" + "=" * 60)
+        print(name)
+        print("=" * 60)
+
+        changed = np.sum(
+            predictions != y_pred_raw
+        )
+
+        print(
+            "Predicciones modificadas respecto a RAW:",
+            changed
+        )
+
+        report_text = classification_report(
+            y_true,
+            predictions,
+            labels=labels_idx,
+            target_names=classes,
+            zero_division=0
+        )
+
+        print(report_text)
+
+        # Reporte como diccionario para tabla resumen
+        report_dict = classification_report(
+            y_true,
+            predictions,
+            labels=labels_idx,
+            target_names=classes,
+            zero_division=0,
+            output_dict=True
+        )
+
+        summary_rows.append({
+            "filter": name,
+            "changed_predictions": int(changed),
+            "accuracy": report_dict["accuracy"],
+            "macro_precision":
+                report_dict["macro avg"]["precision"],
+            "macro_recall":
+                report_dict["macro avg"]["recall"],
+            "macro_f1":
+                report_dict["macro avg"]["f1-score"],
+            "weighted_f1":
+                report_dict["weighted avg"]["f1-score"]
+        })
+
+        # ======================================
+        # GUARDAR REPORTE
+        # ======================================
+
+        with open(
+            os.path.join(
+                run_results,
+                f"classification_report_{name.lower()}.txt"
+            ),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(report_text)
+
+        # ======================================
+        # MATRIZ DE CONFUSIÓN
+        # ======================================
+
+        cm = confusion_matrix(
+            y_true,
+            predictions,
+            labels=labels_idx
+        )
+
+        cm_percent = np.divide(
+            cm.astype(float),
+            cm.sum(axis=1, keepdims=True),
+            out=np.zeros_like(cm, dtype=float),
+            where=cm.sum(
+                axis=1,
+                keepdims=True
+            ) != 0
+        ) * 100
+
+        plt.figure(figsize=(10, 8))
+
+        sns.heatmap(
+            cm_percent,
+            annot=True,
+            fmt=".1f",
+            cmap="Blues",
+            xticklabels=classes,
+            yticklabels=classes
+        )
+
+        plt.xlabel("Predicho")
+        plt.ylabel("Real")
+
+        plt.title(
+            f"Matriz de confusión {name} (%)"
+        )
+
+        plt.tight_layout()
+
+        plt.savefig(
+            os.path.join(
+                run_results,
+                f"confusion_matrix_{name.lower()}.png"
+            ),
+            dpi=300
+        )
+
+        plt.show()
+        plt.close()
+
+        np.save(
+            os.path.join(
+                run_results,
+                f"y_pred_{name.lower()}_test.npy"
+            ),
+            predictions
+        )
+
+    # ==========================================
+    # TABLA RESUMEN
+    # ==========================================
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    summary_df.to_csv(
+        os.path.join(
+            run_results,
+            "temporal_filters_comparison.csv"
+        ),
+        index=False
+    )
+
+    print("\n===== COMPARACIÓN FINAL =====")
+    print(summary_df.to_string(index=False))
+
+    return summary_df
+```
+
+```{python}
+def evaluate_temporal_filter(run_results):
+
+    import json
+
+    y_true = np.load(
+        os.path.join(run_results, "y_true_test.npy")
+    )
+
+    y_pred_raw = np.load(
+        os.path.join(run_results, "y_pred_raw_test.npy")
+    )
+
+    video_ids = np.load(
+        os.path.join(run_results, "video_ids_test.npy")
+    )
+
+    window_starts = np.load(
+        os.path.join(run_results, "window_starts_test.npy")
+    )
+
+    with open(
+        os.path.join(run_results, "experiment_info.json"),
+        "r",
+        encoding="utf-8"
+    ) as f:
+        info = json.load(f)
+
+    classes = np.array(info["classes"])
+    step_size = int(info["step_size"])
+    window_size = int(info["window_size"])
+    fps = int(info["fps"])
+
+    if not (
+        len(y_true) == len(y_pred_raw)
+        == len(video_ids) == len(window_starts)
+    ):
+        raise ValueError("Los arrays del experimento no coinciden.")
+
+    # ==========================================
+    # APLICAR FILTRO
+    # ==========================================
+
+    y_pred_smoothed = smooth_temporal_predictions(
+        y_pred_raw,
+        video_ids,
+        window_starts,
+        step_size
+    )
+
+    changed = y_pred_raw != y_pred_smoothed
+
+    print("Predicciones modificadas:", changed.sum())
+    print("Total de ventanas:", len(y_pred_raw))
+
+    # ==========================================
+    # COMPARACIÓN DE MÉTRICAS
+    # ==========================================
+
+    labels_idx = np.arange(len(classes))
+
+    for name, predictions in [
+        ("RAW", y_pred_raw),
+        ("SMOOTHED", y_pred_smoothed)
+    ]:
+
+        print(f"\n===== RESULTADOS {name} =====")
+
+        report = classification_report(
+            y_true,
+            predictions,
+            labels=labels_idx,
+            target_names=classes,
+            zero_division=0
+        )
+
+        print(report)
+
+        with open(
+            os.path.join(
+                run_results,
+                f"classification_report_{name.lower()}.txt"
+            ),
+            "w",
+            encoding="utf-8"
+        ) as f:
+            f.write(report)
+
+        cm = confusion_matrix(
+            y_true,
+            predictions,
+            labels=labels_idx
+        )
+
+        cm_percent = np.divide(
+            cm.astype(float),
+            cm.sum(axis=1, keepdims=True),
+            out=np.zeros_like(cm, dtype=float),
+            where=cm.sum(axis=1, keepdims=True) != 0
+        ) * 100
+
+        plt.figure(figsize=(10, 8))
+
+        sns.heatmap(
+            cm_percent,
+            annot=True,
+            fmt=".1f",
+            cmap="Blues",
+            xticklabels=classes,
+            yticklabels=classes
+        )
+
+        plt.xlabel("Predicho")
+        plt.ylabel("Real")
+        plt.title(f"Matriz de confusión {name} (%)")
+
+        plt.tight_layout()
+
+        plt.savefig(
+            os.path.join(
+                run_results,
+                f"confusion_matrix_{name.lower()}.png"
+            ),
+            dpi=300
+        )
+
+        plt.show()
+        plt.close()
+
+        np.save(
+            os.path.join(
+                run_results,
+                f"confusion_matrix_{name.lower()}.npy"
+            ),
+            cm
+        )
+
+    # ==========================================
+    # GUARDAR PREDICCIONES POR VENTANA
+    # ==========================================
+
+    results_df = pd.DataFrame({
+        "video_id": video_ids,
+        "window_start_frame": window_starts,
+        "window_end_frame_exclusive": window_starts + window_size,
+        "start_seconds": window_starts / fps,
+        "end_seconds": (window_starts + window_size) / fps,
+        "y_true": classes[y_true],
+        "y_pred_raw": classes[y_pred_raw],
+        "y_pred_smoothed": classes[y_pred_smoothed],
+        "changed_by_filter": changed
+    })
+
+    results_df.to_csv(
+        os.path.join(
+            run_results,
+            "test_window_predictions.csv"
+        ),
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+    np.save(
+        os.path.join(
+            run_results,
+            "y_pred_smoothed_test.npy"
+        ),
+        y_pred_smoothed
+    )
+
+    print("\nPostprocesamiento completado.")
+    print("Resultados guardados en:", run_results)
+
+```
+```{python}
+FILTER_RESULTS = r"c:\Users\Usuario\Desktop\CIN-2\results\experiments\v05_focal_filtro_temporal_20260929_115111_b03713\run_20260929_122624_fe9dad"
+
+summary_filters = evaluate_additional_temporal_filters(
+    FILTER_RESULTS
+)
+```
+
+```{python}
+#if TRAIN_MODEL:
+#    train_model()
+```
+## Análisis de distribución de features
+```{python}
+evaluate_temporal_filter(
+    r"c:\Users\Usuario\Desktop\CIN-2\results\experiments\v05_focal_filtro_temporal_20260929_115111_b03713\run_20260929_122624_fe9dad"
+)
+
+```
+```{python}
+def plot_feature_distributions():
+    X_train = np.load(os.path.join(BASE_DIR, "X_train.npy"))
+    y_train = np.load(os.path.join(BASE_DIR, "y_train.npy"))
+
+    print("X_train:", X_train.shape)
+    print("y_train:", y_train.shape)
+
+    # Si X_train está en forma 3D: (muestras, frames, features)
+    if len(X_train.shape) == 3:
+        # Promedio SOLO para graficar, NO para entrenar
+        X_plot = X_train.mean(axis=1)
+    else:
+        timesteps = WINDOW_SIZE
+        n_features = X_train.shape[1] // timesteps
+        X_plot = X_train.reshape(len(X_train), timesteps, n_features).mean(axis=1)
+
+    y_train = np.array([str(label).strip() for label in y_train])
+
+    # Orden en v04: [..., elongation, body_angular_vel, rel_speed,
+    # head_rotation, centroid_speed, left_front, right_front, left_back,
+    # right_back] -> 9 columnas finales (antes 8, se agregó centroid_speed
+    # y body_angle fue reemplazado por body_angular_vel).
+    feature_indices = {
+        "elongation": -9,
+        "body_angular_vel": -8,
+        "rel_speed_centroid": -7,
+        "head_rotation": -6,
+        "centroid_speed": -5,
+        "left_front_angle": -4,
+        "right_front_angle": -3,
+        "left_back_angle": -2,
+        "right_back_angle": -1,
+    }
+
+    for feature_name, idx in feature_indices.items():
+        plt.figure(figsize=(10, 6))
+
+        for behavior in np.unique(y_train):
+            values = X_plot[y_train == behavior, idx]
+            plt.hist(
+                values,
+                bins=40,
+                alpha=0.4,
+                label=behavior,
+                density=True
+            )
+
+        plt.title(f"Distribución de {feature_name} por comportamiento")
+        plt.xlabel(feature_name)
+        plt.ylabel("Densidad")
+        plt.legend()
+        plt.tight_layout()
+
+        filename = f"hist_{feature_name}.png"
+        plt.savefig(os.path.join(RESULTS_FOLDER, filename), dpi=300)
+        plt.show()
+
+        print("Guardado:", filename)
+```
+```{python}
+plot_feature_distributions()
+```
+
+## Diagnóstico — distribución de estadísticas por ventana (S_train)
+
+`plot_feature_distributions()` solo inspecciona `X_train` (features por
+frame, promediadas). Las features más nuevas y potencialmente más
+diagnósticas para la confusión Desplazamiento/Inmovilidad/Rearing viven
+en `S_train` (`straightness`, `path_length`, `net_displacement`,
+`centroid_speed`, `periodicity_ratio`) y no se veían en ningún lado
+hasta ahora.
+
+```{python}
+def plot_window_stats_distributions():
+    S_train = np.load(os.path.join(BASE_DIR, "S_train.npy"))
+    y_train = np.load(os.path.join(BASE_DIR, "y_train.npy"))
+    y_train = np.array([str(label).strip() for label in y_train])
+
+    stat_names = [
+        "speed_mean", "speed_std", "speed_min", "speed_max",
+        "centroid_speed_mean", "centroid_speed_std",
+        "path_length", "net_displacement", "straightness",
+        "elongation_std", "body_angular_vel_std",
+        "periodicity_ratio",
+    ]
+
+    for idx, name in enumerate(stat_names):
+        plt.figure(figsize=(10, 6))
+        for behavior in np.unique(y_train):
+            values = S_train[y_train == behavior, idx]
+            plt.hist(values, bins=40, alpha=0.4, label=behavior, density=True)
+        plt.title(f"Distribución de {name} por comportamiento (S_train)")
+        plt.xlabel(name)
+        plt.ylabel("Densidad")
+        plt.legend()
+        plt.tight_layout()
+
+        filename = f"hist_stat_{name}.png"
+        plt.savefig(os.path.join(RESULTS_FOLDER, filename), dpi=300)
+        plt.show()
+        print("Guardado:", filename)
+```
+
+```{python}
+plot_window_stats_distributions()
+```
+
+## Diagnóstico — outliers y separación real (recortada) por clase
+
+Los histogramas de `S_train` sin recortar quedan dominados por un puñado
+de ventanas con valores extremos (probablemente saltos de tracking de
+DLC en algún frame de esa ventana, no comportamiento real), que aplastan
+la escala y esconden cualquier separación en el rango donde vive el 95%
+de los datos. Esto NO cambia los datos, solo el rango visible del
+gráfico, y además cuenta cuántas ventanas por clase tienen algún valor
+fuera de un rango razonable — un proxy de "ventanas contaminadas por
+glitch de tracking".
+
+```{python}
+def plot_window_stats_distributions_clipped(lower_pct=1, upper_pct=99):
+    S_train = np.load(os.path.join(BASE_DIR, "S_train.npy"))
+    y_train = np.load(os.path.join(BASE_DIR, "y_train.npy"))
+    y_train = np.array([str(label).strip() for label in y_train])
+
+    stat_names = [
+        "speed_mean", "speed_std", "speed_min", "speed_max",
+        "centroid_speed_mean", "centroid_speed_std",
+        "path_length", "net_displacement", "straightness",
+        "elongation_std", "body_angular_vel_std",
+        "periodicity_ratio",
+    ]
+
+    for idx, name in enumerate(stat_names):
+        col = S_train[:, idx]
+        lo, hi = np.percentile(col, [lower_pct, upper_pct])
+
+        plt.figure(figsize=(10, 6))
+        for behavior in np.unique(y_train):
+            values = S_train[y_train == behavior, idx]
+            values = values[(values >= lo) & (values <= hi)]
+            plt.hist(values, bins=40, alpha=0.4, label=behavior, density=True)
+        plt.title(f"{name} por comportamiento (recortado a percentiles {lower_pct}-{upper_pct})")
+        plt.xlabel(name)
+        plt.ylabel("Densidad")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # Cuántas ventanas por clase tienen al menos un valor extremo
+    # (fuera de percentiles 0.5-99.5) en alguna de las 12 estadísticas.
+    print("\n--- Ventanas con al menos un valor extremo (posible glitch de tracking) ---")
+    lo_all = np.percentile(S_train, 0.5, axis=0)
+    hi_all = np.percentile(S_train, 99.5, axis=0)
+    is_outlier = ((S_train < lo_all) | (S_train > hi_all)).any(axis=1)
+
+    for behavior in np.unique(y_train):
+        mask = y_train == behavior
+        n_out = is_outlier[mask].sum()
+        pct = 100 * n_out / mask.sum()
+        print(f"{behavior:15s}: {n_out:4d} / {mask.sum():5d} ventanas ({pct:.1f}%)")
+```
+
+```{python}
+plot_window_stats_distributions_clipped()
+```
+
+```{python}
+import os
+import joblib
+import numpy as np
+import tensorflow as tf
+
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# ==========================================
+# BUSCAR LA ÚLTIMA CORRIDA GUARDADA
+# ==========================================
+
+run_folders = [
+    os.path.join(EXPERIMENT_MODELS, folder)
+    for folder in os.listdir(EXPERIMENT_MODELS)
+    if os.path.isdir(os.path.join(EXPERIMENT_MODELS, folder))
+]
+
+LATEST_MODEL_RUN = max(
+    run_folders,
+    key=os.path.getmtime
+)
+
+print("Modelo cargado desde:")
+print(LATEST_MODEL_RUN)
+```
+# ==========================================
+# CARGAR MODELO Y PREPROCESAMIENTO
+# ==========================================
+```{python}
+model_val = tf.keras.models.load_model(
+    os.path.join(
+        LATEST_MODEL_RUN,
+        "lstm_model.keras"
+    ),
+    compile=False
+)
+
+scaler_val = joblib.load(
+    os.path.join(
+        LATEST_MODEL_RUN,
+        "scaler.pkl"
+    )
+)
+
+stats_scaler_val = joblib.load(
+    os.path.join(
+        LATEST_MODEL_RUN,
+        "stats_scaler.pkl"
+    )
+)
+
+le_val = joblib.load(
+    os.path.join(
+        LATEST_MODEL_RUN,
+        "label_encoder.pkl"
+    )
+)
+
+print("Modelo y objetos cargados.")
+print("Clases:", le_val.classes_)
+```
+# ==========================================
+# CARGAR VALIDATION
+# ==========================================
+```{python}
+# ==========================================
+# PREPARAR VALIDATION
+# ==========================================
+
+X_val_eval = np.load(
+    os.path.join(BASE_DIR, "X_val.npy")
+)
+
+S_val_eval = np.load(
+    os.path.join(BASE_DIR, "S_val.npy")
+)
+
+y_val_eval = np.load(
+    os.path.join(BASE_DIR, "y_val.npy")
+)
+
+print("X_val:", X_val_eval.shape)
+print("S_val:", S_val_eval.shape)
+print("y_val:", y_val_eval.shape)
+
+# Escalar X_val usando SOLO el scaler ya entrenado
+n_val, timesteps, n_features = X_val_eval.shape
+
+X_val_2d = X_val_eval.reshape(
+    -1,
+    n_features
+)
+
+X_val_2d = scaler_val.transform(
+    X_val_2d
+)
+
+X_val_scaled = X_val_2d.reshape(
+    n_val,
+    timesteps,
+    n_features
+)
+
+# Escalar las estadísticas
+S_val_scaled = stats_scaler_val.transform(
+    S_val_eval
+)
+
+# Preparar etiquetas
+y_val_clean = np.array([
+    str(label).strip()
+    for label in y_val_eval
+])
+
+y_val_true = le_val.transform(
+    y_val_clean
+)
+
+print("\nVALIDATION preparado correctamente")
+print("X_val_scaled:", X_val_scaled.shape)
+print("S_val_scaled:", S_val_scaled.shape)
+print("y_val_true:", y_val_true.shape)
+
+```
+```{python}
+# ==========================================
+# PREDICCIÓN SOBRE VALIDATION
+# ==========================================
+
+y_val_probs = model_val.predict(
+    [X_val_scaled, S_val_scaled]
+)
+
+y_val_pred = np.argmax(
+    y_val_probs,
+    axis=1
+)
+
+accuracy_val = np.mean(
+    y_val_pred == y_val_true
+)
+
+print(
+    "\nAccuracy VALIDATION:",
+    accuracy_val
+)
+
+print(
+    "\n===== RESULTADOS VALIDATION ====="
+)
+
+print(
+    classification_report(
+        y_val_true,
+        y_val_pred,
+        labels=np.arange(len(le_val.classes_)),
+        target_names=le_val.classes_,
+        zero_division=0
+    )
+)
+cm_val = confusion_matrix(
+    y_val_true,
+    y_val_pred,
+    labels=np.arange(len(le_val.classes_))
+)
+
+cm_val_percent = np.divide(
+    cm_val.astype(float),
+    cm_val.sum(axis=1, keepdims=True),
+    out=np.zeros_like(cm_val, dtype=float),
+    where=cm_val.sum(axis=1, keepdims=True) != 0
+) * 100
+
+plt.figure(figsize=(10, 8))
+
+sns.heatmap(
+    cm_val_percent,
+    annot=True,
+    fmt=".1f",
+    cmap="Blues",
+    xticklabels=le_val.classes_,
+    yticklabels=le_val.classes_
+)
+
+plt.xlabel("Predicho")
+plt.ylabel("Real")
+plt.title(
+    "Matriz de confusión VALIDATION (%)"
+)
+
+plt.tight_layout()
+plt.show()
+```
+## Codigo combinado
+
+```{python}
+
+generate_features()
+
+build_dataset()
+
+train_model()   
+
+```
+
+
+```{python}
+X_train = np.load(os.path.join(BASE_DIR, "X_train.npy"))
+S_train = np.load(os.path.join(BASE_DIR, "S_train.npy"))
+print(X_train.shape)  # esperado: (N, 45, 198) -> secuencia 3D, 198 features/frame (antes 197)
+print(S_train.shape)  # esperado: (N, 12) -> antes (N, 4)
+```
